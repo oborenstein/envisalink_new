@@ -55,6 +55,20 @@ class EnvisalinkClient:
         self._activeTasks = set()
         self._reconnect_time = _RECONNECT_MIN_TIME
         self._connect_time = 0
+        self._last_rx_time = 0
+
+    # Liveness is "bytes arrived recently", not "the last command was acknowledged": a
+    # single lost keepalive ack (e.g. swallowed by a truncated frame) should not tear down
+    # a session that is visibly alive. A healthy link delivers at least the keepalive ack
+    # every keepalive_interval, so the window is 2.5 x that. With keepalive_interval 0
+    # there is no window and the previous behaviour is kept exactly.
+    def _liveness_window(self):
+        interval = self._alarmPanel.keepalive_interval
+        return 2.5 * interval if interval > 0 else None
+
+    def _rx_within_liveness_window(self, now) -> bool:
+        window = self._liveness_window()
+        return window is not None and (now - self._last_rx_time) < window
 
     def create_internal_task(self, coro, name=None):
         task = self._eventLoop.create_task(coro, name=name)
@@ -126,6 +140,17 @@ class EnvisalinkClient:
                             if not self._loggedin and ((time.time() - self._connect_time) > self._alarmPanel.connection_timeout):
                                 _LOGGER.error("Timed out waiting to complete login handshake; disconnecting.")
                                 await self.disconnect()
+                            elif (
+                                self._loggedin
+                                and self._liveness_window() is not None
+                                and not self._rx_within_liveness_window(time.time())
+                            ):
+                                # A truly silent EVL is still caught.
+                                _LOGGER.error(
+                                    "Nothing received from the EVL for %ds; disconnecting.",
+                                    self._liveness_window(),
+                                )
+                                await self.disconnect()
                             continue
                         except asyncio.IncompleteReadError:
                             data = None
@@ -140,6 +165,7 @@ class EnvisalinkClient:
                                 await self.disconnect()
                             break
 
+                        self._last_rx_time = time.time()
                         _LOGGER.debug("{---------------------------------------")
                         _LOGGER.log(PROTOCOL_DEBUG, "RX < %r", data)
 
@@ -551,6 +577,16 @@ class EnvisalinkClient:
                     if op.state == self.Operation.State.SENT:
                         # Still waiting on a response from the EVL so break out of loop and wait
                         # for the response
+                        if now >= op.expiryTime and self._rx_within_liveness_window(now):
+                            # The ack was lost but the EVL is still talking, so fail just
+                            # this command and keep the session.
+                            _LOGGER.warning(
+                                "Command '%s' got no acknowledgement but the EVL is still "
+                                "sending; not reconnecting",
+                                op.cmd,
+                            )
+                            op.state = self.Operation.State.FAILED
+                            continue
                         if now >= op.expiryTime:
                             # Timeout waiting for response from the EVL so fail the command,
                             # This is likely due to the EVL becoming unresponsive so tear down the
